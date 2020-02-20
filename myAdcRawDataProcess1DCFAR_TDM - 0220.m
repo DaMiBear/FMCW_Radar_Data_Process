@@ -16,10 +16,6 @@ Params.Tc = 160e-6;                 %chirp周期 ????
 Params.NChan_V = 2*4;               %MIMO中包括虚拟天线总数 Ntx*Nrx
 Params.NChirp_V = Params.NChirp/2;  %分离出虚拟天线的数据后chirp会减半
 Params.Tc_V = 2*Params.Tc;          %有虚拟天线，chirp的周期要加倍
-Params.dopplerNTrain = 12;          %doppler维度cfar训练单元数目
-Params.dopplerNGuard = 2;           %doppler维度cfar保护单元数目
-Params.rangeNTrain = 3;            %range维度cfar训练单元数目
-Params.rangeNGuard = 2;             %range维度cfar保护单元数目
 Params.dopplerPFA = 0.03;           %多普勒维cfarPFA
 Params.rangePFA = 0.05;             %距离维cfarPFA
 
@@ -41,21 +37,36 @@ dataSet.radarCubeData = processingChain_rangeFFT(1);
 %     (-Params.NChirp/2:Params.NChirp/2 - 1)*Params.lambda/Params.Tc/Params.NChirp/2);    
 % mesh(X,Y,abs(reshape(dataSet.radarCubeData(:,1,:),Params.NChirp,Params.NSample)));
 % title('1d fft 结果');
-
 % 执行多普勒FFT
 dataSet.radarCubeData = processingChain_dopplerFFT(1);
 
-%对NChirp_V个接收天线Chan求和
-dataSet.sumFFT2D_radarCubeData = processingChain_noncorrelationSum();
 
-%建立三维图的格点
+%对NChirp_V个接收天线Chan求和
+dataSet.sumFFT2D_radarCubeData = single(zeros(Params.NChirp_V,Params.NSample));   %创建一个NChirp_V行 NSample列的空二维数组
+for chanNum = 1:Params.NChan_V
+    %把三维数组变为二维数组
+    FFT2D_radarCubeData = reshape(dataSet.radarCubeData(:,chanNum,:),Params.NChirp_V,Params.NSample);   
+    %求模->取log->相加
+    dataSet.sumFFT2D_radarCubeData = (abs(FFT2D_radarCubeData)) + dataSet.sumFFT2D_radarCubeData;
+%     mesh(X,Y,10*log10(abs(reshape(dataSet.radarCubeData(:,chanNum,:),Params.NChirp,Params.NSample))));
+%     figure;
+end
+
+dopplerDimCfarThresholdMap = zeros(size(dataSet.sumFFT2D_radarCubeData));  %创建一个二维矩阵存放doppler维cfar后的结果
+dopplerDimCfarResultMap = zeros(size(dataSet.sumFFT2D_radarCubeData));
+
+
 [X,Y] = meshgrid(Params.c*(0:Params.NSample-1)*Params.Fs/2/Params.freqSlope/Params.NSample, ...
                 (-Params.NChirp_V/2:Params.NChirp_V/2 - 1)*Params.lambda/Params.Tc_V/Params.NChirp_V/2);    
-    
-% 多普勒CFAR
-[dopplerDimCfarThresholdMap,dopplerDimCfarResultMap] = processingChain_dopplerCFAR();
 
-% 绘图
+% 多普勒维度进行CFAR
+for i = 1:Params.NSample
+    dopplerDim = reshape(dataSet.sumFFT2D_radarCubeData(:,i),1,Params.NChirp_V);  %变成一行数据
+    [cfar1D_Arr,threshold] = ac_cfar1D(12,2,Params.dopplerPFA,dopplerDim);  %进行1D cfar
+    dopplerDimCfarResultMap(:,i) = cfar1D_Arr.'; 
+    dopplerDimCfarThresholdMap(:,i) = threshold.';
+end
+
 mesh(X,Y,(20*log10(dataSet.sumFFT2D_radarCubeData)));
 xlabel('距离(m)');ylabel('速度(m/s)');zlabel('信号幅值dB');
 title('四天线求和后的2D_FFT结果');
@@ -71,9 +82,43 @@ xlabel('距离(m)');ylabel('速度(m/s)');zlabel('信号幅值dB');
 title('doppler维度CFAR判决结果');
 figure;
 
-% 距离CFAR
-[rangeDimCfarThresholdMap,rangeDimCfarResultMap] = processingChain_rangeCFAR(dopplerDimCfarResultMap);
+%沿着doppler维度方向寻找在doppler维cfar判决后为1的结果
+saveMat = zeros(size(dataSet.sumFFT2D_radarCubeData));
+for range = 1:Params.NSample
+    indexArr = find(dopplerDimCfarResultMap(:,range)==1);
+    objDopplerArr = [indexArr;zeros(Params.NChirp_V - length(indexArr),1)];   %补充长度
+    saveMat(:,range) = objDopplerArr; %保存doppler下标
+end
+% 保存有物体的doppler坐标
+objDopplerIndex = unique(saveMat);  % unqiue是不重复的返回数组中的数
 
+% 根据之前doppler维的cfar结果对应的下标saveMat，对相应的速度进行range维度的CFAR
+rangeDimCfarThresholdMap = zeros(size(dataSet.sumFFT2D_radarCubeData));  %创建一个二维矩阵存放range维cfar后的结果
+rangeDimCfarResultMap = zeros(size(dataSet.sumFFT2D_radarCubeData));
+i = 1;
+while(i<=length(objDopplerIndex))
+    if(objDopplerIndex(i)==0)   % 因为数组里面有0,防止下面j取到0
+        i = i + 1;
+        continue;
+    else    %根据速度下标进行range CFAR
+        j = objDopplerIndex(i);     % 获得物体所在的行
+        rangeDim = reshape(dataSet.sumFFT2D_radarCubeData(j, :),1,Params.NSample);  %变成一行数据
+        % tip 这个PFA很迷啊,如果设置的低一些,在进行分支聚集的时候,可能的结果是没有检测到物体
+        % 因为在进行rangeCFAR的时候,把附近的最大值给滤掉了,那这样在进行峰值聚集的时候,判决结果对应的最大值一直是小的
+        % ╮(╯▽╰)╭
+        [cfar1D_Arr,threshold] = ac_cfar1D(3,2,Params.rangePFA,rangeDim);  %进行1D cfar
+        rangeDimCfarResultMap(j,:) = cfar1D_Arr; 
+        rangeDimCfarThresholdMap(j,:) = threshold;
+        i = i + 1;
+        
+        plot(20*log10(rangeDim));hold on;
+        plot(20*log10(threshold));
+        title(['距离维度门限dopplerIndex=',num2str(j)]);
+        xlabel('距离(m)');ylabel('信号幅值dB');
+        figure;
+        
+    end
+end
 % plot((rangeDim));hold on;
 % plot(threshold);
 mesh(X,Y,(rangeDimCfarResultMap));
@@ -84,8 +129,9 @@ ylim([(-Params.NChirp_V/2)*Params.lambda/Params.Tc_V/Params.NChirp_V/2    (Param
 figure;
 
 % 进行峰值聚焦
-[objDprIdx,objRagIdx] = processingChain_peakFocus(rangeDimCfarResultMap);
-
+[objDprIdx,objRagIdx] = peakFocus(rangeDimCfarResultMap);
+objDprIdx(objDprIdx==0)=[]; %去掉后面的0
+objRagIdx(objRagIdx==0)=[];
 % 根据物体的点,计算速度和距离
 objSpeed = ( objDprIdx - Params.NChirp_V/2 - 1)*Params.lambda/Params.Tc_V/Params.NChirp_V/2;
 objRange = single(Params.c*(objRagIdx-1)*Params.Fs/2/Params.freqSlope/Params.NSample);
@@ -94,6 +140,7 @@ xlabel('距离(m)');ylabel('速度(m/s)');
 title('峰值聚集后');
 xlim([0     Params.c*(Params.NSample-1)*Params.Fs/2/Params.freqSlope/Params.NSample]);
 ylim([(-Params.NChirp_V/2)*Params.lambda/Params.Tc_V/Params.NChirp_V/2    (Params.NChirp_V/2 - 1)*Params.lambda/Params.Tc_V/Params.NChirp_V/2]);
+
 
 
 % 如果有物体则进行角度FFT
@@ -141,6 +188,9 @@ end
 % title('2D FFT cfar后');
 % xlim([0     Params.c*(Params.NSample-1)*Params.Fs/2/Params.freqSlope/Params.NSample]);
 % ylim([(-Params.NChirp/2)*Params.lambda/Params.Tc/Params.NChirp/2    (Params.NChirp/2 - 1)*Params.lambda/Params.Tc/Params.NChirp/2]);
+
+
+
 
 
 % rangeProfileData = dataSet.radarCubeData(1, 1, :);
@@ -244,7 +294,6 @@ function  dp_separateVirtualRx()
     % 提取完毕后删除chirp坐标为2 4 6...偶数的行   这样会导致chirp数减半变为每一帧有原来一般的个数比如128/2
     dataSet.rawFrameData(2:2:NChirp,:,:) = [];
 end
-
 % 对数据进行距离FFT
 function [radarCubeData] = processingChain_rangeFFT(rangeWinType)
     global Params;
@@ -304,123 +353,6 @@ function [radarCubeData] = processingChain_dopplerFFT(rangeWinType)
     end
 end
 
-% 非相关求和
-% 对各个天线维度进行求和变成一个二维矩阵
-% 输出：sumFFT2D_radarCubeData - 求和后的二维矩阵
-function [sumFFT2D_radarCubeData] = processingChain_noncorrelationSum()
-    global dataSet;
-    global Params;
-    sumFFT2D_radarCubeData = single(zeros(Params.NChirp_V,Params.NSample));   %创建一个NChirp_V行 NSample列的空二维数组
-    for chanNum = 1:Params.NChan_V
-        %把三维数组变为二维数组
-        FFT2D_radarCubeDataOneChan = reshape(dataSet.radarCubeData(:,chanNum,:),Params.NChirp_V,Params.NSample);   
-        %求模->相加
-        sumFFT2D_radarCubeData = (abs(FFT2D_radarCubeDataOneChan)) + sumFFT2D_radarCubeData;
-    %     mesh(X,Y,10*log10(abs(reshape(dataSet.radarCubeData(:,chanNum,:),Params.NChirp,Params.NSample))));
-    %     figure;
-    end
-end
-
-% 1D CFAR
-% 输入：NTrain - 训练单元数
-% NGuard - 保护单元数
-% inputArr - 输入一维数组
-% 输出：cfar1D_Arr - 门限判决后的结果 1or0
-% threshold - 判决门限
-function [cfar1D_Arr,threshold] = processingChain_ac_cfar1D(NTrain,NGuard,PFA,inputArr)
-    cfar1D_Arr = zeros(size(inputArr));
-    threshold = zeros(size(inputArr));
-
-    totalNTrain = 2*(NTrain);
-    a = totalNTrain*((PFA^(-1/totalNTrain))-1);
-    %求平均值
-    for i = NTrain+NGuard+1:length(inputArr)-NTrain-NGuard
-        avg = mean([inputArr((i-NTrain-NGuard):(i-NGuard-1))   inputArr((i+NGuard+1):(i+NTrain+NGuard))]);
-        threshold(1,i) = a.*avg;
-        %根据threshold比较
-        if(inputArr(i) < threshold(i))
-            cfar1D_Arr(i) = 0;
-        else
-            cfar1D_Arr(i) = 1;
-        end
-    end
-    
-end
- 
-% 多普勒CFAR 找出物体的速度
-% 输入：dataSet.sumFFT2D_radarCubeData - 求和后的2dfft结果
-% 输出：dopplerDimCfarThresholdMap - 判决门限
-% dopplerDimCfarResultMap - 判决结果
-function [dopplerDimCfarThresholdMap,dopplerDimCfarResultMap] = processingChain_dopplerCFAR()
-    global dataSet;
-    global Params;
-    %初始化一个二维矩阵存放doppler维cfar后的结果
-    dopplerDimCfarThresholdMap = zeros(size(dataSet.sumFFT2D_radarCubeData));  
-    dopplerDimCfarResultMap = zeros(size(dataSet.sumFFT2D_radarCubeData));
-
-    % 多普勒每个维度进行CFAR
-    for i = 1:Params.NSample
-        %变成一行数据
-        dopplerDim = reshape(dataSet.sumFFT2D_radarCubeData(:,i),1,Params.NChirp_V);  
-        %doppler维进行1D cfar
-        [cfar1D_Arr,threshold] = processingChain_ac_cfar1D(Params.dopplerNTrain,...
-                                                           Params.dopplerNGuard,...
-                                                           Params.dopplerPFA,...
-                                                           dopplerDim);  
-        dopplerDimCfarThresholdMap(:,i) = threshold.'; 
-        dopplerDimCfarResultMap(:,i) = cfar1D_Arr.'; 
-        
-    end
-end
-
-% 距离cfar 找出物体距离
-% 输入：dopplerDimCfarResultMap - dopplerCFAR判决结果
-% 输出：rangeDimCfarThresholdMap - rangeCFAR门限
-% rangeDimCfarResultMap - rangeCFAR判决结果
-function  [rangeDimCfarThresholdMap,rangeDimCfarResultMap] = processingChain_rangeCFAR(dopplerDimCfarResultMap)
-    global dataSet;
-    global Params;
-    %沿着doppler维度方向寻找在doppler维cfar判决后为1的结果
-    saveMat = zeros(size(dataSet.sumFFT2D_radarCubeData));
-    for range = 1:Params.NSample
-        indexArr = find(dopplerDimCfarResultMap(:,range)==1);
-        objDopplerArr = [indexArr;zeros(Params.NChirp_V - length(indexArr),1)];   %补充长度
-        saveMat(:,range) = objDopplerArr; %保存doppler下标
-    end
-    % 保存有物体的doppler坐标
-    objDopplerIndex = unique(saveMat);  % unqiue是不重复的返回数组中的数
-
-    % 根据之前doppler维的cfar结果对应的下标saveMat，对相应的速度进行range维度的CFAR
-    rangeDimCfarThresholdMap = zeros(size(dataSet.sumFFT2D_radarCubeData));  %初始化二维矩阵存放range维cfar后的结果
-    rangeDimCfarResultMap = zeros(size(dataSet.sumFFT2D_radarCubeData));
-    i = 1;
-    while(i<=length(objDopplerIndex))
-        if(objDopplerIndex(i)==0)   % 因为数组里面有0,防止下面j取到0
-            i = i + 1;
-            continue;
-        else    %根据速度下标进行range CFAR
-            j = objDopplerIndex(i);     % 获得物体所在的行
-            rangeDim = reshape(dataSet.sumFFT2D_radarCubeData(j, :),1,Params.NSample);  %变成一行数据
-            % tip 这个PFA很迷啊,如果设置的低一些,在进行分支聚集的时候,可能的结果是没有检测到物体
-            % 因为在进行rangeCFAR的时候,把附近的最大值给滤掉了,那这样在进行峰值聚集的时候,判决结果对应的最大值一直是小的
-            % ╮(╯▽╰)╭
-            [cfar1D_Arr,threshold] = processingChain_ac_cfar1D(Params.rangeNTrain,Params.rangeNGuard,Params.rangePFA,rangeDim);  %进行1D cfar
-            rangeDimCfarThresholdMap(j,:) = threshold;
-            rangeDimCfarResultMap(j,:) = cfar1D_Arr; 
-            
-            i = i + 1;
-
-            plot(20*log10(rangeDim));hold on;
-            plot(20*log10(threshold));
-            title(['距离维度门限dopplerIndex=',num2str(j)]);
-            xlabel('距离(m)');ylabel('信号幅值dB');
-            figure;
-
-        end
-    end
-end
-
-% 2D CA-CFAR函数
 % 输入:NTrainRange - 距离维度训练单元数量
 % NGuardRange - 距离维度保护单元数量
 % NTrainDoppler - 多普勒维度
@@ -468,11 +400,30 @@ function [cfar_radarCubeData,tMap] = ac_cfar(NTrainRange,NGuardRange,NTrainDoppl
     end
 end
 
-% 峰值聚集
+function [cfar1D_Arr,threshold] = ac_cfar1D(NTrain,NGuard,PFA,inputArr)
+    cfar1D_Arr = zeros(size(inputArr));
+    threshold = zeros(size(inputArr));
+
+    totalNTrain = 2*(NTrain);
+    a = totalNTrain*((PFA^(-1/totalNTrain))-1);
+    %求平均值
+    for i = NTrain+NGuard+1:length(inputArr)-NTrain-NGuard
+        avg = mean([inputArr((i-NTrain-NGuard):(i-NGuard-1))   inputArr((i+NGuard+1):(i+NTrain+NGuard))]);
+        threshold(1,i) = a.*avg;
+        %根据threshold比较
+        if(inputArr(i) < threshold(i))
+            cfar1D_Arr(i) = 0;
+        else
+            cfar1D_Arr(i) = 1;
+        end
+    end
+    
+end
+ 
 % 输入: inputCfarResMat - 进行峰值聚焦的二维矩阵,即进行range维CFAR判决后得到的结果矩阵
 % 输出: row - 物体的行坐标(对应速度)
 % column - 物体的列坐标(对应距离)
-function [row,column] = processingChain_peakFocus(inputCfarResMat)
+function [row,column] = peakFocus(inputCfarResMat)
     global dataSet;
     global Params;
     j = 1;
@@ -496,8 +447,6 @@ function [row,column] = processingChain_peakFocus(inputCfarResMat)
             j = j+1;
         end
     end
-    row(row==0)=[]; %去掉后面的0
-    column(column==0)=[];
 end
 
 
